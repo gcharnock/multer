@@ -4,6 +4,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures_util::future;
 use futures_util::stream::{Stream, TryStreamExt};
+use http::HeaderMap;
 use spin::mutex::spin::SpinMutex as Mutex;
 #[cfg(feature = "tokio-io")]
 use {tokio::io::AsyncRead, tokio_util::io::ReaderStream};
@@ -251,19 +252,52 @@ impl<'r> Multipart<'r> {
             return Poll::Ready(Ok(None));
         }
 
-        state.buffer.poll_stream(cx)?;
+        let mut stream_polled = false;
 
+        loop {
+            match Self::parse_uptil_next_field(state)? {
+                ParseUpToNextFieldResult::Done => return Poll::Ready(Ok(None)),
+                ParseUpToNextFieldResult::NeedMore => {
+                    if stream_polled {
+                        // If we have polled the stream once and we still need more we must now wait
+                        return Poll::Pending;
+                    } else {
+                        if state.buffer.eof {
+                            // We need more but the stream has ended
+                            return Poll::Ready(Err(Error::IncompleteStream));
+                        }
+
+                        // Correctness: poll_stream polls until either eof or the inner stream
+                        // returns Poll::Pending so if it returns Ok(()) we can safely assume it has
+                        // registered to be woken up
+                        if let Err(err) = state.buffer.poll_stream(cx) {
+                            return Poll::Ready(Err(Error::StreamReadFailed(err.into())));
+                        }
+                        stream_polled = true;
+                    }
+                }
+                ParseUpToNextFieldResult::Field {
+                    headers,
+                    field_idx,
+                    content_disposition,
+                } => {
+                    drop(lock); // The lock will be dropped anyway, but let's be explicit.
+                    let field = Field::new(self.state.clone(), headers, field_idx, content_disposition);
+                    return Poll::Ready(Ok(Some(field)));
+                }
+            }
+        }
+    }
+
+    /// parse the bytes from the buffer into state, looking for the next field. If the field is not
+    /// found, stop and request more bytes to be added to the buffer
+    fn parse_uptil_next_field(state: &mut MultipartState<'_>) -> Result<ParseUpToNextFieldResult> {
         if state.stage == StreamingStage::FindingFirstBoundary {
             let boundary = &state.boundary;
             let boundary_deriv = format!("{}{}", constants::BOUNDARY_EXT, boundary);
             match state.buffer.read_to(boundary_deriv.as_bytes()) {
                 Some(_) => state.stage = StreamingStage::ReadingBoundary,
-                None => {
-                    state.buffer.poll_stream(cx)?;
-                    if state.buffer.eof {
-                        return Poll::Ready(Err(Error::IncompleteStream));
-                    }
-                }
+                None => return Ok(ParseUpToNextFieldResult::NeedMore),
             }
         }
 
@@ -277,20 +311,20 @@ impl<'r> Multipart<'r> {
                     state.curr_field_size_counter += bytes.len() as u64;
 
                     if state.curr_field_size_counter > state.curr_field_size_limit {
-                        return Poll::Ready(Err(Error::FieldSizeExceeded {
+                        return Err(Error::FieldSizeExceeded {
                             limit: state.curr_field_size_limit,
                             field_name: state.curr_field_name.clone(),
-                        }));
+                        });
                     }
 
                     if done {
                         state.stage = StreamingStage::ReadingBoundary;
                     } else {
-                        return Poll::Pending;
+                        return Ok(ParseUpToNextFieldResult::NeedMore);
                     }
                 }
                 None => {
-                    return Poll::Pending;
+                    return Ok(ParseUpToNextFieldResult::NeedMore);
                 }
             }
         }
@@ -301,19 +335,13 @@ impl<'r> Multipart<'r> {
 
             let boundary_bytes = match state.buffer.read_exact(boundary_deriv_len) {
                 Some(bytes) => bytes,
-                None => {
-                    return if state.buffer.eof {
-                        Poll::Ready(Err(Error::IncompleteStream))
-                    } else {
-                        Poll::Pending
-                    };
-                }
+                None => return Ok(ParseUpToNextFieldResult::NeedMore),
             };
 
             if &boundary_bytes[..] == format!("{}{}", constants::BOUNDARY_EXT, boundary).as_bytes() {
                 state.stage = StreamingStage::DeterminingBoundaryType;
             } else {
-                return Poll::Ready(Err(Error::IncompleteStream));
+                return Err(Error::IncompleteStream);
             }
         }
 
@@ -321,18 +349,12 @@ impl<'r> Multipart<'r> {
             let ext_len = constants::BOUNDARY_EXT.len();
             let next_bytes = match state.buffer.peek_exact(ext_len) {
                 Some(bytes) => bytes,
-                None => {
-                    return if state.buffer.eof {
-                        Poll::Ready(Err(Error::IncompleteStream))
-                    } else {
-                        Poll::Pending
-                    };
-                }
+                None => return Ok(ParseUpToNextFieldResult::NeedMore),
             };
 
             if next_bytes == constants::BOUNDARY_EXT.as_bytes() {
                 state.stage = StreamingStage::Eof;
-                return Poll::Ready(Ok(None));
+                return Ok(ParseUpToNextFieldResult::Done);
             } else {
                 state.stage = StreamingStage::ReadingTransportPadding;
             }
@@ -340,42 +362,26 @@ impl<'r> Multipart<'r> {
 
         if state.stage == StreamingStage::ReadingTransportPadding {
             if !state.buffer.advance_past_transport_padding() {
-                return if state.buffer.eof {
-                    Poll::Ready(Err(Error::IncompleteStream))
-                } else {
-                    Poll::Pending
-                };
+                return Ok(ParseUpToNextFieldResult::NeedMore);
             }
 
             let crlf_len = constants::CRLF.len();
             let crlf_bytes = match state.buffer.read_exact(crlf_len) {
                 Some(bytes) => bytes,
-                None => {
-                    return if state.buffer.eof {
-                        Poll::Ready(Err(Error::IncompleteStream))
-                    } else {
-                        Poll::Pending
-                    };
-                }
+                None => return Ok(ParseUpToNextFieldResult::NeedMore),
             };
 
             if &crlf_bytes[..] == constants::CRLF.as_bytes() {
                 state.stage = StreamingStage::ReadingFieldHeaders;
             } else {
-                return Poll::Ready(Err(Error::IncompleteStream));
+                return Err(Error::IncompleteStream);
             }
         }
 
         if state.stage == StreamingStage::ReadingFieldHeaders {
             let header_bytes = match state.buffer.read_until(constants::CRLF_CRLF.as_bytes()) {
                 Some(bytes) => bytes,
-                None => {
-                    return if state.buffer.eof {
-                        return Poll::Ready(Err(Error::IncompleteStream));
-                    } else {
-                        Poll::Pending
-                    };
-                }
+                None => return Ok(ParseUpToNextFieldResult::NeedMore),
             };
 
             let mut headers = [httparse::EMPTY_HEADER; constants::MAX_HEADERS];
@@ -385,12 +391,12 @@ impl<'r> Multipart<'r> {
                     match helpers::convert_raw_headers_to_header_map(raw_headers) {
                         Ok(headers) => headers,
                         Err(err) => {
-                            return Poll::Ready(Err(err));
+                            return Err(err);
                         }
                     }
                 }
                 httparse::Status::Partial => {
-                    return Poll::Ready(Err(Error::IncompleteHeaders));
+                    return Err(Error::IncompleteHeaders);
                 }
             };
 
@@ -411,17 +417,28 @@ impl<'r> Multipart<'r> {
 
             let field_name = content_disposition.field_name.as_deref();
             if !state.constraints.is_it_allowed(field_name) {
-                return Poll::Ready(Err(Error::UnknownField {
+                return Err(Error::UnknownField {
                     field_name: field_name.map(str::to_owned),
-                }));
+                });
             }
 
-            drop(lock); // The lock will be dropped anyway, but let's be explicit.
-            let field = Field::new(self.state.clone(), headers, field_idx, content_disposition);
-            return Poll::Ready(Ok(Some(field)));
+            return Ok(ParseUpToNextFieldResult::Field {
+                headers,
+                field_idx,
+                content_disposition,
+            });
         }
-
-        Poll::Pending
+        /*
+            Should be unreacable. It's not clear what would be safe to do
+            if this is reached.
+            * if we loop back to the start, it's not any more "obvious" that progress
+              can be made that that this is unreachable. Similar issue for calling
+              the waker ourselves and returning Poll::Pending
+            * if we have the caller return Poll::Pending, we may not have not polled the
+              underlying stream which means we might never get woken up again
+            * if we return NeedMore we may end up buffering more than we need, using memory.
+        */
+        unreachable!()
     }
 
     /// Yields the next [`Field`] with their positioning index as a tuple
@@ -456,4 +473,14 @@ impl<'r> Multipart<'r> {
     pub async fn next_field_with_idx(&mut self) -> Result<Option<(usize, Field<'r>)>> {
         self.next_field().await.map(|f| f.map(|field| (field.index(), field)))
     }
+}
+
+enum ParseUpToNextFieldResult {
+    NeedMore,
+    Done,
+    Field {
+        headers: HeaderMap,
+        field_idx: usize,
+        content_disposition: ContentDisposition,
+    },
 }
